@@ -1,0 +1,307 @@
+#!/usr/bin/env bash
+# All transports are local fixtures; never connect to an SSH server.
+# Fixture commands deliberately expand variables in the simulated remote shell.
+# shellcheck disable=SC2016
+set -euo pipefail
+repository=$(realpath -- "$(dirname -- "${BASH_SOURCE[0]}")/..")
+source_dir="$repository/src"
+shellcheck -s bash "$source_dir/shell-away.sh" "${BASH_SOURCE[0]}"
+shellcheck -s sh "$source_dir/bootstrap.sh" "$source_dir/init.sh"
+test_bash=$(command -v bash)
+test_sh=$(command -v sh)
+test_zsh=$(command -v zsh)
+test_script=$(command -v script)
+test_env=$(command -v env)
+test_ls=$(command -v ls)
+test_base64=$(command -v base64)
+work=$(mktemp -d)
+children=()
+cleanup() {
+  for child in "${children[@]}"; do
+    kill "$child" 2>/dev/null || :
+    wait "$child" 2>/dev/null || :
+  done
+  rm -rf -- "$work"
+}
+trap cleanup EXIT
+mkdir -p "$work/bundle" "$work/home" "$work/temp with ' quote" "$work/bin"
+bundle="$work/bundle"
+if [[ -n "${SHELL_AWAY_BUNDLE:-}" ]]; then
+  cp "$SHELL_AWAY_BUNDLE"/{bootstrap.sh,init.sh,aliases.sh,starship.toml,flake.nix,flake.lock,.zshrc} "$bundle/"
+else
+  cp "$source_dir"/{bootstrap.sh,init.sh} "$bundle/"
+  printf '%s\n' '. "$SHELL_AWAY_SESSION/init.sh"' > "$bundle/.zshrc"
+  printf '%s\n' 'alias ll="eza --long --all --group-directories-first --icons=auto --header --git"' > "$bundle/aliases.sh"
+  printf '%s\n' 'format = "$hostname$directory$character"' > "$bundle/starship.toml"
+  printf '%s\n' '{}' > "$bundle/flake.nix"
+  printf '%s\n' '{}' > "$bundle/flake.lock"
+fi
+chmod u+w "$bundle/"* "$bundle/.zshrc"
+for tool in uname mktemp rm tar base64 sh ls grep cat wc dirname; do
+  ln -s "$(command -v "$tool")" "$work/bin/$tool"
+done
+for file in .zshrc .zshenv .bashrc .profile; do
+  printf 'printf unexpected > "%s"\n' "$work/home/unexpected-startup" > "$work/home/$file"
+done
+printf 'preserve history\n' > "$work/home/.bash_history"
+home_before=$(tar -C "$work/home" -cf - . | sha256sum)
+
+cat > "$work/bin/ssh" <<EOF
+#!$test_bash
+set -euo pipefail
+printf '%s\\n' "\$@" > "\$SHELL_AWAY_TEST_ARGS"
+printf '%s\\n' "\$TERM" > "\$SHELL_AWAY_TEST_ARGS.term"
+exec "$test_sh" -c "\${!#}"
+EOF
+cat > "$work/bin/tailscale" <<EOF
+#!$test_bash
+set -euo pipefail
+test "\$1" = ssh
+shift
+exec "\$(dirname "\$0")/ssh" "\$@"
+EOF
+chmod +x "$work/bin/ssh" "$work/bin/tailscale"
+common=("HOME=$work/home" "TMPDIR=$work/temp with ' quote" "PATH=$work/bin"
+  "SHELL_AWAY_TEST_ARGS=$work/args" "bundle_dir=$bundle" "SHELL=$test_bash")
+cli=("$test_env" "${common[@]}" "$test_bash" -euo pipefail "$source_dir/shell-away.sh")
+
+expect_status() {
+  local expected=$1
+  shift
+  local status=0
+  "$@" > "$work/result" 2>&1 || status=$?
+  if [[ "$status" != "$expected" ]]; then
+    command cat "$work/result" >&2
+    printf 'Expected exit %s, got %s.\n' "$expected" "$status" >&2
+    exit 1
+  fi
+}
+assert_clean() {
+  if [[ -n $(find "$work/temp with ' quote" -mindepth 1 -print -quit) ]]; then
+    printf 'Session files were left behind.\n' >&2
+    exit 1
+  fi
+}
+run_session() {
+  local kind=$1
+  shift
+  rm -f "$work/bin/zsh" "$work/bin/bash"
+  case "$kind" in
+    zsh) ln -s "$test_zsh" "$work/bin/zsh" ;;
+    bash) ln -s "$test_bash" "$work/bin/bash" ;;
+    sh) ;;
+  esac
+  local status=0
+  local session_command
+  printf -v session_command '%q ' "${cli[@]}" "$@" user@fixture
+  printf '%s\n' \
+    'printf "RESULT_KIND=%s\n" "$SHELL_AWAY_KIND"' \
+    'printf "RESULT_HOME=%s\n" "$HOME"' \
+    'printf "RESULT_TERM=%s\n" "$TERM"' \
+    'printf "RESULT_HISTORY=%s\n" "${HISTFILE-unset}"' \
+    'printf "RESULT_STARSHIP=%s\n" "${STARSHIP_SHELL-none}"' \
+    'if command -v z >/dev/null 2>&1; then printf "RESULT_ZOXIDE=ready\n"; fi' \
+    'alias ll' \
+    'false' \
+    'exit 17' | \
+    "$test_env" "SHELL=$test_bash" "$test_script" -q -e -E never -c "$session_command" /dev/null \
+    > "$work/result" 2>&1 || status=$?
+  if [[ "$status" != 17 ]]; then
+    command cat "$work/result" >&2
+    printf 'Interactive %s session returned %s instead of 17.\n' "$kind" "$status" >&2
+    exit 1
+  fi
+  rg -Fq "RESULT_KIND=$kind" "$work/result"
+  rg -Fq "RESULT_HOME=$work/home" "$work/result"
+  rg -Fq 'RESULT_HISTORY=unset' "$work/result"
+  if [[ ! -e "$work/bin/starship" ]]; then
+    rg -Fq '[1]' "$work/result"
+  fi
+  assert_clean
+}
+
+expect_status 0 "${cli[@]}" --help
+expect_status 64 "${cli[@]}"
+expect_status 64 "${cli[@]}" --unknown
+expect_status 64 "${cli[@]}" fixture extra
+expect_status 64 "${cli[@]}" 'host;touch bad'
+test ! -e "$work/args"
+run_session zsh
+run_session bash
+run_session sh --tailscale
+rg -Fxq user@fixture "$work/args"
+rg -Fxq ClearAllForwardings=yes "$work/args"
+rg -Fxq 'SendEnv=-*' "$work/args"
+rg -Fxq xterm-256color "$work/args.term"
+rg -Fq 'ls -lah --group-directories-first' "$work/result"
+
+# Simulate macOS uname, BSD base64 and BSD ls while running actual shells.
+rm "$work/bin/uname"
+cat > "$work/bin/uname" <<EOF
+#!$test_sh
+case "\$1" in -s) printf 'Darwin\\n';; -n) printf 'fixture\\n';; -m) printf 'arm64\\n';; esac
+EOF
+rm "$work/bin/base64" "$work/bin/ls"
+cat > "$work/bin/base64" <<EOF
+#!$test_sh
+case "\$1" in -d) exit 1;; -D) exec "$test_base64" -d;; *) exec "$test_base64" "\$@";; esac
+EOF
+cat > "$work/bin/ls" <<EOF
+#!$test_sh
+case "\$1" in --*) exit 2;; *) exec "$test_ls" "\$@";; esac
+EOF
+chmod +x "$work/bin/"{ssh,tailscale,uname,base64,ls}
+run_session zsh
+rg -Fq "ll='ls -lah'" "$work/result"
+rm "$work/bin/uname" "$work/bin/base64" "$work/bin/ls"
+for tool in uname base64 ls; do ln -s "$(command -v "$tool")" "$work/bin/$tool"; done
+
+# Modern eza keeps the shared aliases; an old/incompatible one falls back.
+cat > "$work/bin/eza" <<EOF
+#!$test_sh
+exit 0
+EOF
+chmod +x "$work/bin/eza"
+run_session zsh
+rg -Fq 'eza --long --all --group-directories-first --icons=auto --header --git' "$work/result"
+printf '#!%s\nexit 2\n' "$test_sh" > "$work/bin/eza"
+run_session bash
+rg -Fq 'ls -lah --group-directories-first' "$work/result"
+rm "$work/bin/eza"
+
+# Terminfo fallback and unusable-terminal failure.
+cat > "$work/bin/infocmp" <<EOF
+#!$test_sh
+test "\$1" = vt100
+EOF
+chmod +x "$work/bin/infocmp"
+run_session bash
+rg -Fq 'RESULT_TERM=vt100' "$work/result"
+printf '#!%s\nexit 1\n' "$test_sh" > "$work/bin/infocmp"
+expect_status 69 "${cli[@]}" fixture
+assert_clean
+rm "$work/bin/infocmp"
+
+# Exercise installed integrations without downloading tools or using home state.
+integrations=()
+for tool in starship fzf zoxide; do
+  if tool_path=$(command -v "$tool"); then
+    ln -s "$tool_path" "$work/bin/$tool"
+    integrations+=("$tool")
+  fi
+done
+if ((${#integrations[@]})); then
+  run_session zsh
+  [[ ! -e "$work/bin/starship" ]] || rg -Fq 'RESULT_STARSHIP=zsh' "$work/result"
+  [[ ! -e "$work/bin/zoxide" ]] || rg -Fq 'RESULT_ZOXIDE=ready' "$work/result"
+  run_session bash
+  [[ ! -e "$work/bin/starship" ]] || rg -Fq 'RESULT_STARSHIP=bash' "$work/result"
+  [[ ! -e "$work/bin/zoxide" ]] || rg -Fq 'RESULT_ZOXIDE=ready' "$work/result"
+  for tool in "${integrations[@]}"; do rm "$work/bin/$tool"; done
+fi
+
+# Nix is explicit and its exit code is preserved. No real Nix is executed.
+cat > "$work/bin/nix" <<EOF
+#!$test_sh
+for argument do
+  if [ "\$argument" = eval ]; then
+    printf '%s\\n' "\${SHELL_AWAY_TEST_NIX_SYSTEM:-x86_64-linux}"
+    exit 0
+  fi
+done
+printf '%s\\n' "\$@" > "$work/nix-args"
+exit 42
+EOF
+chmod +x "$work/bin/nix"
+expect_status 42 "${cli[@]}" --nix fixture
+rg -Fxq -- --no-update-lock-file "$work/nix-args"
+rg -Fxq -- --no-write-lock-file "$work/nix-args"
+assert_clean
+rm "$work/nix-args"
+expect_status 69 "$test_env" SHELL_AWAY_TEST_NIX_SYSTEM=x86_64-darwin "${cli[@]}" --nix fixture
+rg -Fq 'no longer supports Intel macOS' "$work/result"
+test ! -e "$work/nix-args"
+assert_clean
+expect_status 69 "$test_env" SHELL_AWAY_TEST_NIX_SYSTEM=unsupported "${cli[@]}" --nix fixture
+rg -Fq 'unsupported Nix platform' "$work/result"
+assert_clean
+cat > "$work/bin/nix" <<EOF
+#!$test_sh
+for argument do
+  if [ "\$argument" = eval ]; then printf 'x86_64-linux\\n'; exit 0; fi
+done
+exec "$test_sh" "\$SHELL_AWAY_SESSION/bootstrap.sh" existing
+EOF
+run_session zsh --nix
+rm "$work/bin/nix"
+if [[ ! -x /nix/var/nix/profiles/default/bin/nix ]]; then
+  expect_status 69 "${cli[@]}" --nix fixture
+  rg -Fq 'requires Nix on the target' "$work/result"
+  assert_clean
+else
+  printf 'Missing-Nix fixture skipped: the default system profile provides Nix.\n'
+fi
+
+# Two live sessions must not remove each other's directories.
+rm "$work/bin/zsh"
+cat > "$work/bin/zsh" <<EOF
+#!$test_sh
+printf '%s\\n' "\$SHELL_AWAY_SESSION" > "\$SHELL_AWAY_TEST_RECORD"
+read -r release < "\$SHELL_AWAY_TEST_GATE"
+EOF
+chmod +x "$work/bin/zsh"
+for index in 1 2; do
+  mkfifo "$work/gate.$index"
+  "$test_env" "SHELL_AWAY_TEST_RECORD=$work/session.$index" \
+    "SHELL_AWAY_TEST_GATE=$work/gate.$index" "${common[@]}" \
+    "$test_bash" -euo pipefail "$source_dir/shell-away.sh" fixture \
+    > "$work/output.$index" 2>&1 &
+  children+=("$!")
+done
+for index in 1 2; do
+  for ((attempt=0; attempt<100; attempt++)); do
+    [[ -s "$work/session.$index" ]] && break
+    sleep 0.02
+  done
+  test -s "$work/session.$index"
+done
+session_one=$(command cat "$work/session.1")
+session_two=$(command cat "$work/session.2")
+test "$session_one" != "$session_two"
+test -d "$session_one"
+test -d "$session_two"
+printf 'release\n' > "$work/gate.1"
+wait "${children[0]}"
+unset 'children[0]'
+test ! -e "$session_one"
+test -d "$session_two"
+printf 'release\n' > "$work/gate.2"
+wait "${children[1]}"
+children=()
+assert_clean
+
+# Handled disconnect signals reach the owning process and remove its files.
+for signal in HUP TERM; do
+  cat > "$work/bin/zsh" <<EOF
+#!$test_bash
+kill -$signal "\$PPID"
+exit 0
+EOF
+  expected=129
+  [[ "$signal" == TERM ]] && expected=143
+  expect_status "$expected" "${cli[@]}" fixture
+  assert_clean
+done
+
+rm "$work/bin/tailscale"
+expect_status 69 "${cli[@]}" --tailscale fixture
+cp "$bundle/starship.toml" "$work/prompt-backup"
+dd if=/dev/zero bs=40000 count=1 status=none > "$bundle/starship.toml"
+rm "$work/args"
+expect_status 65 "${cli[@]}" fixture
+test ! -e "$work/args"
+assert_clean
+mv "$work/prompt-backup" "$bundle/starship.toml"
+home_after=$(tar -C "$work/home" -cf - . | sha256sum)
+test "$home_before" = "$home_after"
+printf 'Shell-away: transports, real interactive shells, fallbacks, Nix, signals and session isolation passed.\n'
