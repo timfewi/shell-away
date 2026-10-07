@@ -26,7 +26,9 @@ shell-away [--tailscale] [--nix] HOST
   zsh, Starship, Eza, Ripgrep, fd, Fzf, Bat, Git, Rsync and Zoxide. Only the
   public Nixpkgs input is needed on the target. The wrapper never installs Nix,
   activates profiles or updates lockfiles; Nix can download or build packages
-  and they stay in its store after the session ends.
+  and they stay in its store after the session ends. The pinned Nixpkgs
+  supports x86-64/AArch64 Linux and Apple-Silicon macOS; Intel macOS targets
+  can use the default mode, while `--nix` reports the unsupported platform.
 
 The default mode downloads nothing. The target needs a POSIX shell, `uname`,
 `mktemp`, `rm`, `tar` and `base64`.
